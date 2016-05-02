@@ -1,0 +1,94 @@
+--- #Script ls
+- hosts: aptserver
+  user: test
+  sudo: yes
+  connection: ssh
+  gather_facts: no
+  vars:
+    nombase: files
+    userbase: ansiblectrl
+    usepss: ansiblepassword
+
+  tasks:
+    - name: lister nom, taille et date modification des fichiers du repertoire et stocker dans un fichier
+      raw: find  /usr -type f -exec ls -lt {} \; |tr -s ' ' | cut -d " " -f9,8,7,6,5 > fichier.txt
+    - name: transformer en csv
+      raw: awk -F " " '{print  $5 "," $3 $2 $4 "," $1}' fichier.txt > fichier.csv
+    - name: recuperation des lignes du fichier et placer dans un tableau pour preparer a l insertion dans la base
+      shell: awk -F ","  '{print "\047 " $1 "\047,\047" $2 "\047," $3}' fichier.csv 
+      register: tablignes
+      
+    - name: updating
+      raw: apt-get update
+    - name: Installation Postgresql
+      apt: name={{item}} state=installed
+      with_items:
+        - postgresql
+        - libpq-dev
+        - python-psycopg2
+      notify: start postgresql
+
+    - name: verifier la creation de la base
+      postgresql_db: name={{ nombase }}
+
+    - name: ensure user has access to database
+      postgresql_user: db={{ nombase }} name={{ userbase }} password={{ usepss }} priv=ALL
+    - name: Effacer la table si elle existe 
+      command: psql -U ansiblectrl files -c "DROP TABLE IF EXISTS filesTable;"
+
+    - name: Creation table
+      command: psql -U ansiblectrl files -c 'CREATE TABLE filesTable (NomFichier varchar(200), DateModification varchar(25),Taille bigint);'
+    - name: insertion par elemnt des noms de fichiers
+      command: psql -U ansiblectrl files -c "insert into filesTable values ({{ item }});"
+      with_items: "{{  tablignes.stdout_lines }} "
+
+    - name: Calcul de la somme des tailles de fichiers
+      command: psql -U ansiblectrl files -c "select sum(Taille) from filesTable;"
+      register: resSomme
+    - raw: echo {{ resSomme }} > somme.txt
+    - shell: sed '1d;2d;4d;5d' somme.txt > somme2.txt
+    - shell: cat somme2.txt 
+      register: som2
+    - debug: var=som2
+    - raw: echo "La taille totale des fichiers sous /usr est ==>  {{ item }}" >> /var/log/syslog.conf
+      with_items: "{{ som2.stdout_lines }} "
+
+    - name: Affichage table
+      command: psql -U ansiblectrl -d files -c "SELECT * FROM filesTable;"
+      register: affichage
+    - debug: var=affichage
+
+    - name: Modification de la banniere
+      shell: wc -l fichier.csv > nblignes
+    - shell: awk -F " "  '{print  $1 }' nblignes > nblignes2
+    - shell: cat nblignes2
+      register: nbrlignes
+    - debug: var=nbrlignes
+      
+  
+    - raw: echo "Nombre de fichier sous /usr est ==> {{ item }}" > /etc/motd
+      with_items: "{{ nbrlignes.stdout_lines }} "
+
+    - raw: echo "Espace consomme par les fichiers sous /usr est ==> {{ item }}" >> /etc/motd
+      with_items: "{{ som2.stdout_lines }} "
+   
+
+  handlers:
+    - name: start postgresql
+      service: name=postgresql state=restarted
+
+- hosts: local
+  user: test
+  sudo: yes
+  gather_facts: no
+  tasks:
+    - name: verifier si le job existe
+      raw: crontab -l | grep scriptLS.yml > cronVerify
+    - raw: wc -l cronVerify > cron2V
+    - shell: awk -F " "  '{print  $1 }' cron2V > cron2F
+    - shell: cat cron2F
+      register: exists
+    - debug: var=exists
+    - name: Add a cron job to the test user
+      cron: name="playbook_cron" minute="*/1" job="ansible-playbook /home/test/Playbooks/scriptLS.yml > /home/test/cronresultPlaybook.log"
+      when: exists != '0'
